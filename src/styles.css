@@ -119,12 +119,11 @@ input {
 }
 
 .brand-mark {
-  width: 10px;
-  height: 10px;
-  border-radius: 3px;
-  background: var(--accent);
-  box-shadow: 0 0 0 4px rgba(139, 147, 248, 0.14);
+  width: 22px;
+  height: 22px;
+  display: block;
   align-self: center;
+  flex: none;
 }
 
 .brand-name {
@@ -236,6 +235,14 @@ input {
 .btn-xs {
   height: 24px;
   font-size: 11px;
+}
+
+/* Undo / redo sit in the panel head, so they shrink to a square. */
+.btn-undo {
+  width: 26px;
+  padding: 0;
+  font-size: 14px;
+  line-height: 1;
 }
 
 .btn-icon {
@@ -454,6 +461,15 @@ input {
 .time.muted {
   color: var(--ink-faint);
   text-align: right;
+}
+
+/* Live preview rate, shown only while playing. */
+.fps {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-faint);
+  min-width: 46px;
 }
 
 .transport audio {

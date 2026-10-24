@@ -2,6 +2,7 @@
   "name": "motiflow",
   "private": true,
   "version": "0.1.0",
+  "description": "Write motion. A browser-only motion-graphics studio: text recipe in, clean MP4 out.",
   "type": "module",
   "scripts": {
     "dev": "vite",

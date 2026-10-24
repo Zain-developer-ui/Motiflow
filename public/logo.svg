@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" width="120" height="120" role="img" aria-label="Motiflow">
+  <defs>
+    <linearGradient id="mf" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#5A63C4" />
+      <stop offset="1" stop-color="#8B93F8" />
+    </linearGradient>
+  </defs>
+  <rect width="120" height="120" rx="26" fill="#0F1012" />
+  <circle cx="60" cy="60" r="38" fill="none" stroke="url(#mf)" stroke-width="7" />
+  <polygon points="52,40 52,80 82,60" fill="url(#mf)" stroke="url(#mf)" stroke-width="2.5" stroke-linejoin="round" />
+</svg>

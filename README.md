@@ -1,12 +1,29 @@
+<p align="center">
+  <img src="public/apple-touch-icon.png" width="76" height="76" alt="Motiflow">
+</p>
+
 # Motiflow
 
 **Write motion.**
 
-A motion-graphics studio that runs entirely in your browser. You write (or paste) a
-short text recipe, Motiflow renders it live, and you export a clean MP4 — no watermark,
-no length cap, no account, no server bill.
+A motion-graphics studio that runs entirely in your browser. You write (or paste) a short
+text recipe, Motiflow renders it live, and you export a clean MP4 — no watermark, no
+length cap, no account, no server bill.
 
-![Motiflow studio](docs/studio.png)
+[![Stack](https://img.shields.io/badge/React_19-TypeScript-191713)](https://github.com/Zain-developer-ui/Motiflow)
+[![Export](https://img.shields.io/badge/MP4-H.264_%2B_AAC-5A63C4)](https://github.com/Zain-developer-ui/Motiflow)
+[![Runs](https://img.shields.io/badge/100%25-in_your_browser-2E7D5B)](https://github.com/Zain-developer-ui/Motiflow)
+
+| Landscape | Reel |
+| --- | --- |
+| ![Motiflow studio](docs/studio.png) | ![Motiflow in 9:16](docs/portrait.png) |
+
+### Why another video tool
+
+Templates give you someone else's taste; editors give you a timeline and a learning curve.
+Motiflow gives you a text file. Motion is described in lines that read like a shot list, so
+the same recipe renders identically at 720p, 1080p, 16:9 and 9:16, and an AI model can
+write one for you. Everything — parsing, drawing, encoding — happens on your machine.
 
 ---
 
@@ -43,6 +60,17 @@ GitHub Pages, Netlify) and it works.
 Assets: Motiflow does not generate images. You paste the image prompt it gives you into
 any image model, then keep the prompt in your notes — the recipe only positions and
 animates what you describe.
+
+### What it does not do
+
+- **No auto transcription.** Paste the script or upload the `.srt` you already have.
+- **No image or video generation.** It animates type, shapes and emoji.
+- **One audio track** for now; multi-track mixing arrives with the timeline.
+- **No keyframe UI yet.** Keyframes exist in the recipe, not in a graph.
+- **Firefox** previews fine but cannot export (no H.264 in WebCodecs) — Chrome, Edge and
+  recent Safari can.
+
+Early build: the recipe format is stable enough to use, but may still gain keys.
 
 ---
 
@@ -210,6 +238,22 @@ doing nothing.
 
 ---
 
+## Playback
+
+A playing preview paints the canvas straight from its own animation loop, and the playhead —
+timecode, scrubber, timeline marker — lives in a small store outside React state
+(`src/lib/playhead.tsx`). That distinction matters on a 24-layer recipe: while the time sat in
+component state, every frame re-rendered the editor, the inspector and the whole layer list
+before the next frame could be drawn. Now one frame costs one canvas paint plus a fistful of
+DOM text updates, and a layer row re-renders only when the playhead crosses its start or end.
+
+While playing, the transport shows the rate the machine is actually reaching (`58 fps`). It is
+a measurement, not decoration: if the number drops, the recipe is asking for more than the
+browser can draw at that size. Scrub, pause and step stay exact — the store is written on every
+seek, so the frozen frame is always the frame the timecode claims.
+
+---
+
 ## Export
 
 Hit **Export MP4**. Motiflow draws every frame into an offscreen canvas, feeds it to the
@@ -224,6 +268,10 @@ so a three-minute export is no different from a three-second one.
 - **Formats** — `avc1` High / Main / Baseline are tried in that order, so an older machine
   still gets a valid file.
 - **Filename** — `motiflow-<timestamp>.mp4`.
+
+Measured here: a 10 s 9:16 1080p export is 300 frames and took ~82 s on a laptop, about
+0.27 s per frame, producing a 1.9 MB file with both an `avc1` and an `mp4a` track. Length
+does not change the memory profile — only the time.
 
 Browsers without WebCodecs (Firefox today) still preview perfectly; the export button
 disables itself with an explanation.
@@ -243,6 +291,8 @@ src/
   lib/
     prompt.ts           style presets, .srt parsing, prompt template
     edit.ts             canvas edits → recipe source rewrites
+    playhead.tsx        the playback clock and the controls that read it
+    time.ts             mm:ss.cc formatting
   sample.ts             the 12-second demo recipe
   styles.css            design tokens + layout
   engine/
@@ -264,9 +314,7 @@ docs/
 ## Roadmap
 
 - **Shipped** — recipe engine, 16:9 / 9:16 export with audio, prompt builder, canvas
-  editing (drag, resize, retype, restack, delete), autosave.
-- **Next — undo/redo.** Canvas edits rewrite the source in place; a history stack is the
-  missing safety net.
+  editing (drag, resize, retype, restack, delete), undo/redo, autosave.
 - **Next — project files.** Autosave keeps one draft in `localStorage`; import/export of
   `.motiflow` files (and a few named projects) is the next step.
 - **Later — keyframe inspector.** Edit timing and easing per property in the UI instead of
