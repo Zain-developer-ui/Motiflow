@@ -1,17 +1,39 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { MediaPanel } from './components/MediaPanel';
 import { PromptPanel } from './components/PromptPanel';
 import { canExportInThisBrowser, exportMp4 } from './engine/export';
+import { evalKeys } from './engine/easing';
 import { parseRecipe } from './engine/parse';
 import { createScene, drawSelection, selectionHandles, type HitBox, type Scene } from './engine/scene';
 import type { Layer } from './engine/types';
-import { deleteLayer, setNumber, setPosition, setProp, setText } from './lib/edit';
-import { playhead, previewFps, PreviewFps, Scrub, TimeLabel, TimelinePlayhead, usePlayheadIn } from './lib/playhead';
+import {
+  deleteAsset,
+  loadAssetUrls,
+  putAsset,
+  resolveImageUrl,
+  updateAsset,
+  type AssetRecord,
+} from './lib/assets';
+import {
+  appendLine,
+  deleteLayer,
+  setNumber,
+  setPosition,
+  setProp,
+  setText,
+  setTimeRange,
+  timecode,
+  toggleKey,
+} from './lib/edit';
+import { playhead, previewFps, PreviewFps, Scrub, TimeLabel, usePlayhead, usePlayheadIn } from './lib/playhead';
 import { formatTime } from './lib/time';
 import { SAMPLE_RECIPE } from './sample';
 
 type Aspect = '16:9' | '9:16';
 type Quality = '1080p' | '720p';
-type Tab = 'recipe' | 'prompt';
+type Tab = 'recipe' | 'prompt' | 'media';
+/** Below ~1120 px the side panels become drawers; this says which one is open. */
+type Pane = 'workspace' | 'inspector' | null;
 
 const SIZE = (aspect: Aspect, quality: Quality) => {
   if (aspect === '16:9') {
@@ -24,6 +46,9 @@ const SIZE = (aspect: Aspect, quality: Quality) => {
 const REFERENCE_SHORT_SIDE = 1080;
 const DEFAULT_TEXT_SIZE = Math.round(REFERENCE_SHORT_SIDE * 0.098);
 
+/** Ruler steps, in seconds. The first one wide enough to label wins. */
+const TICK_STEPS = [0.1, 0.25, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300];
+
 /** Undo stack depth and the pause that separates one edit group from the next. */
 const HISTORY_LIMIT = 100;
 const HISTORY_PAUSE = 400;
@@ -32,6 +57,7 @@ const KIND_LABEL: Record<string, string> = {
   scene: 'Scene',
   text: 'Text',
   card: 'Card',
+  image: 'Image',
   camera: 'Camera',
   shape: 'Shape',
 };
@@ -72,11 +98,10 @@ function readProject(): Partial<ProjectDraft> {
 type Drag =
   | {
       mode: 'move';
-      layer: Layer;
+      layers: Layer[];
       startX: number;
       startY: number;
-      baseX: number;
-      baseY: number;
+      base: { layer: Layer; x: number; y: number }[];
       moved: boolean;
     }
   | {
@@ -89,6 +114,32 @@ type Drag =
       baseH: number;
       hasH: boolean;
     };
+
+/** A clip drag owns the window pointer listeners until it is released. */
+interface ClipDrag {
+  mode: 'move' | 'trim-l' | 'trim-r';
+  startX: number;
+  laneWidth: number;
+  duration: number;
+  snap: boolean;
+  moved: boolean;
+  items: { layer: Layer; start: number; end: number }[];
+  ids: string[];
+}
+
+/** Nearest snap target within `threshold`, or null. */
+function nearestSnap(points: number[], value: number, threshold: number): number | null {
+  let best: number | null = null;
+  let bestGap = threshold;
+  for (const point of points) {
+    const gap = Math.abs(point - value);
+    if (gap <= bestGap) {
+      bestGap = gap;
+      best = point;
+    }
+  }
+  return best;
+}
 
 export default function App() {
   const project = useMemo(readProject, []);
@@ -108,17 +159,32 @@ export default function App() {
   const [audioFile, setAudioFile] = useState<File | null>(null);
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
   const [tab, setTab] = useState<Tab>('recipe');
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [pane, setPane] = useState<Pane>(null);
+  const [tlOpen, setTlOpen] = useState(true);
+  const [zoom, setZoom] = useState(1);
+  const [tlBox, setTlBox] = useState(() => ({
+    width: typeof window === 'undefined' ? 900 : Math.max(360, window.innerWidth - 620),
+    label: 196,
+  }));
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [snapOn, setSnapOn] = useState(true);
+  const [snapAt, setSnapAt] = useState<number | null>(null);
+  const [assets, setAssets] = useState<AssetRecord[]>([]);
+  const [assetEpoch, setAssetEpoch] = useState(0);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
   const timeRef = useRef(time);
   const playheadRef = useRef(time);
-  const selectedRef = useRef<string | null>(selectedId);
+  const selectionRef = useRef<string[]>([]);
   const sceneRef = useRef<Scene | null>(null);
   const dragRef = useRef<Drag | null>(null);
+  const clipDrag = useRef<ClipDrag | null>(null);
+  const pendingRaw = useRef<string | null>(null);
+  const assetUrls = useRef(new Map<string, string>());
   const textInputRef = useRef<HTMLInputElement>(null);
+  const tlScrollRef = useRef<HTMLDivElement>(null);
 
   /* ------------------------------- history -------------------------------- */
 
@@ -214,16 +280,56 @@ export default function App() {
 
   const exportable = useMemo(() => canExportInThisBrowser(), []);
   const recipe = useMemo(() => parseRecipe(source), [source]);
+  const recipeRef = useRef(recipe);
+  useEffect(() => {
+    recipeRef.current = recipe;
+  }, [recipe]);
   const duration = Math.max(0.1, recipe.duration);
 
   const errors = recipe.issues.filter((i) => i.severity === 'error');
   const warnings = recipe.issues.filter((i) => i.severity === 'warn');
 
-  const layers = recipe.layers.filter((l) => l.kind !== 'camera');
+  const layers = useMemo(
+    () => [...recipe.layers].sort((a, b) => a.start - b.start || a.z - b.z),
+    [recipe],
+  );
+  const selectedId = selectedIds.length ? selectedIds[selectedIds.length - 1] : null;
   const selected = useMemo(
     () => (selectedId ? recipe.layers.find((l) => l.id === selectedId) ?? null : null),
     [selectedId, recipe],
   );
+  const selectedSet = useMemo(() => new Set(selectedIds), [selectedIds]);
+
+  /** How many recipe lines point at each stored image. */
+  const assetUsage = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const layer of recipe.layers) {
+      if (layer.kind !== 'image') continue;
+      const id = layer.text.startsWith('asset:') ? layer.text.slice(6) : null;
+      if (id) map.set(id, (map.get(id) ?? 0) + 1);
+    }
+    return map;
+  }, [recipe]);
+
+  const selectedAssetId =
+    selected?.kind === 'image' && selected.text.startsWith('asset:') ? selected.text.slice(6) : null;
+  const selectedAsset = useMemo(
+    () => (selectedAssetId ? assets.find((asset) => asset.id === selectedAssetId) ?? null : null),
+    [assets, selectedAssetId],
+  );
+  const selectedAssetUrl = selectedAssetId ? assetUrls.current.get(selectedAssetId) : undefined;
+
+  // Timeline geometry. `zoom` widens the content; everything on the ruler, the
+  // clips and the playhead is positioned from the same pixels-per-second.
+  const laneViewport = Math.max(160, tlBox.width - tlBox.label - 18);
+  const pxPerSec = Math.max(4, (laneViewport / Math.max(0.1, duration)) * zoom);
+  const contentW = Math.max(laneViewport, Math.round(duration * pxPerSec));
+  const tickStep = TICK_STEPS.find((step) => step * pxPerSec >= 62) ?? 120;
+  const ticks = useMemo(() => {
+    const out: number[] = [];
+    for (let t = 0; t <= duration + 0.001; t = Number((t + tickStep).toFixed(3))) out.push(t);
+    return out;
+  }, [duration, tickStep]);
 
   useEffect(() => {
     document.fonts.ready.then(() => setFontsReady(true));
@@ -308,6 +414,57 @@ export default function App() {
     setConfirmDelete(false);
   }, [selectedId]);
 
+  // Escape closes the drawer on narrow screens, the same way it dismisses any
+  // modal surface. It stays out of the undo keydown handler on purpose.
+  useEffect(() => {
+    if (!pane) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setPane(null);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [pane]);
+
+  // Assets arrive from IndexedDB once, then every decoded image bumps `assetEpoch`
+  // so a paused frame can repaint itself.
+  useEffect(() => {
+    let alive = true;
+    loadAssetUrls()
+      .then(({ assets: rows, urls }) => {
+        if (!alive) return;
+        assetUrls.current = urls;
+        setAssets(rows);
+        setAssetEpoch((v) => v + 1);
+      })
+      .catch(() => undefined);
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  const resolveImage = useCallback((src: string) => {
+    if (!src) return null;
+    const url = src.startsWith('asset:') ? assetUrls.current.get(src.slice(6)) : src;
+    if (!url) return null;
+    return resolveImageUrl(url, () => setAssetEpoch((v) => v + 1));
+  }, []);
+
+  // The timeline is laid out in pixels, not percentages, so that zoom can widen
+  // the content and the ruler, clips and playhead stay on the same grid. The
+  // label column can change width with a media query, so read it back on resize.
+  useEffect(() => {
+    const el = tlScrollRef.current;
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    const measure = () => {
+      const label = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--label-col')) || 168;
+      setTlBox({ width: el.clientWidth, label });
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
   /* ------------------------------ painting -------------------------------- */
 
   // The scene only depends on the recipe and the frame size, so build it once per
@@ -315,8 +472,8 @@ export default function App() {
   // which is why the paint is the only work a playing preview should repeat.
   const size = useMemo(() => SIZE(aspect, quality), [aspect, quality]);
   const scene = useMemo(
-    () => createScene(recipe, { width: size.width, height: size.height }),
-    [recipe, size],
+    () => createScene(recipe, { width: size.width, height: size.height }, { resolveImage }),
+    [recipe, size, resolveImage],
   );
 
   useEffect(() => {
@@ -324,8 +481,8 @@ export default function App() {
   }, [scene]);
 
   useEffect(() => {
-    selectedRef.current = selectedId;
-  }, [selectedId]);
+    selectionRef.current = selectedIds;
+  }, [selectedIds]);
 
   // One painter for both modes. Paused previews go through React, but playback
   // paints straight from the animation loop so a frame never waits on a re-render.
@@ -336,10 +493,13 @@ export default function App() {
     const ctx = canvas.getContext('2d', { alpha: false });
     if (!ctx) return;
     current.draw(ctx, at);
-    const id = selectedRef.current;
-    if (!withSelection || !id) return;
-    const box = current.hits(at).find((b) => b.id === id);
-    if (box) drawSelection(ctx, box, canvas.width);
+    const ids = selectionRef.current;
+    if (!withSelection || !ids.length) return;
+    const boxes = current.hits(at);
+    for (const id of ids) {
+      const box = boxes.find((b) => b.id === id);
+      if (box) drawSelection(ctx, box, canvas.width);
+    }
   }, []);
 
   // The backing store follows the export size, not the CSS box.
@@ -353,7 +513,7 @@ export default function App() {
   useEffect(() => {
     if (playing) return; // the animation loop owns the canvas while playing
     paint(Math.min(time, duration), true);
-  }, [playing, time, duration, paint, scene, size, selectedId, fontsReady]);
+  }, [playing, time, duration, paint, scene, size, selectedIds, fontsReady, assetEpoch]);
 
   useEffect(() => {
     if (!playing) return;
@@ -407,6 +567,30 @@ export default function App() {
     [duration],
   );
 
+  const zoomBy = (factor: number) =>
+    setZoom((value) => Math.min(8, Math.max(1, Number((value * factor).toFixed(2)))));
+
+  // Scrubbing the ruler is the studio gesture everyone expects: press anywhere
+  // on the scale, drag, release. Playback stops so the frame under the cursor is
+  // the frame you see.
+  const seekFromRuler = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    setPlaying(false);
+    const rect = event.currentTarget.getBoundingClientRect();
+    const apply = (clientX: number) => {
+      seekTo(Math.max(0, Math.min(duration, (clientX - rect.left) / pxPerSec)));
+    };
+    apply(event.clientX);
+    const move = (ev: PointerEvent) => apply(ev.clientX);
+    const up = () => {
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', up);
+    };
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', up);
+  };
+
   const togglePlay = useCallback(() => {
     if (playing) {
       // Park the UI exactly where the last painted frame is, so pausing does not
@@ -424,9 +608,15 @@ export default function App() {
   }, [playing, duration]);
 
   const selectLayer = useCallback(
-    (layer: Layer) => {
+    (layer: Layer, additive = false) => {
       setPlaying(false);
-      setSelectedId(layer.id);
+      if (additive) {
+        setSelectedIds((prev) =>
+          prev.includes(layer.id) ? prev.filter((id) => id !== layer.id) : [...prev, layer.id],
+        );
+        return;
+      }
+      setSelectedIds([layer.id]);
       seekTo(layer.start);
     },
     [seekTo],
@@ -448,10 +638,12 @@ export default function App() {
       const layer = selectedId ? recipe.layers.find((l) => l.id === selectedId) : null;
       if (!layer) return;
 
-      if (event.key === 'Delete') {
+      if (event.key === 'Delete' || event.key === 'Backspace') {
         event.preventDefault();
-        setSource((prev) => deleteLayer(prev, layer));
-        setSelectedId(null);
+        const targets = recipe.layers.filter((l) => selectedIds.includes(l.id));
+        if (!targets.length) return;
+        setSource((prev) => targets.reduce((src, target) => deleteLayer(src, target), prev));
+        setSelectedIds([]);
         return;
       }
 
@@ -467,7 +659,7 @@ export default function App() {
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [togglePlay, selectedId, recipe]);
+  }, [togglePlay, selectedId, selectedIds, recipe]);
 
   /* ----------------------------- canvas editing ---------------------------- */
 
@@ -538,23 +730,32 @@ export default function App() {
 
     const hit = hitTest(boxes, point.x, point.y);
     if (!hit) {
-      setSelectedId(null);
+      setSelectedIds([]);
       return;
     }
 
-    setSelectedId(hit.id);
+    if (event.shiftKey) {
+      setSelectedIds((prev) =>
+        prev.includes(hit.id) ? prev.filter((id) => id !== hit.id) : [...prev, hit.id],
+      );
+      return;
+    }
+
+    const ids = selectedIds.includes(hit.id) ? selectedIds : [hit.id];
+    setSelectedIds(ids);
     setPlaying(false);
 
-    const layer = recipe.layers.find((l) => l.id === hit.id);
-    if (!layer) return;
+    const base = ids
+      .map((id) => recipe.layers.find((l) => l.id === id))
+      .filter((l): l is Layer => Boolean(l))
+      .map((l) => ({ layer: l, x: l.nums.x ?? 0.5, y: l.nums.y ?? 0.5 }));
 
     dragRef.current = {
       mode: 'move',
-      layer,
+      layers: base.map((b) => b.layer),
       startX: point.x,
       startY: point.y,
-      baseX: layer.nums.x ?? 0.5,
-      baseY: layer.nums.y ?? 0.5,
+      base,
       moved: false,
     };
     try {
@@ -574,9 +775,9 @@ export default function App() {
       const dy = point.y - drag.startY;
       if (!drag.moved && Math.hypot(dx, dy) < 3 * point.scale) return;
       drag.moved = true;
-      const nx = drag.baseX + dx / point.width;
-      const ny = drag.baseY + dy / point.height;
-      setSource((prev) => setPosition(prev, drag.layer, nx, ny));
+      const fx = dx / point.width;
+      const fy = dy / point.height;
+      setSource((prev) => drag.base.reduce((src, item) => setPosition(src, item.layer, item.x + fx, item.y + fy), prev));
       return;
     }
 
@@ -633,10 +834,205 @@ export default function App() {
       window.setTimeout(() => setConfirmDelete(false), 3200);
       return;
     }
-    setSource((prev) => deleteLayer(prev, selected));
-    setSelectedId(null);
+    const targets = recipe.layers.filter((l) => selectedIds.includes(l.id));
+    setSource((prev) => targets.reduce((src, target) => deleteLayer(src, target), prev));
+    setSelectedIds([]);
     setConfirmDelete(false);
   };
+
+  /* ------------------------------ new layers ------------------------------- */
+
+  // A new layer lands at the playhead and is selected for editing straight away.
+  // The raw line is remembered so the next parse can hand back its real layer.
+  const addLayerLine = useCallback(
+    (spec: string) => {
+      const start = Math.max(0, Math.min(playhead.get(), Math.max(0, duration - 0.1)));
+      const end = start + 3;
+      const line = `${timecode(start)} --> ${timecode(end)} ${spec}`;
+      pendingRaw.current = line;
+      setPlaying(false);
+      setSource((prev) => appendLine(prev, line));
+    },
+    [duration],
+  );
+
+  useEffect(() => {
+    const raw = pendingRaw.current;
+    if (!raw) return;
+    const layer = recipe.layers.find((l) => l.raw === raw);
+    if (!layer) return;
+    pendingRaw.current = null;
+    setSelectedIds([layer.id]);
+    seekTo(layer.start);
+  }, [recipe, seekTo]);
+
+  const addImage = async (files: FileList | File[] | undefined) => {
+    const list = Array.from(files ?? []).filter((file) => file.type.startsWith('image/') || /\.svg$/i.test(file.name));
+    if (!list.length) return;
+
+    let first: AssetRecord | null = null;
+    for (const file of list) {
+      const record = await putAsset(file);
+      assetUrls.current.set(record.id, URL.createObjectURL(file));
+      setAssets((prev) => [record, ...prev]);
+      first ??= record;
+    }
+    setAssetEpoch((v) => v + 1);
+    if (first) insertAsset(first);
+  };
+
+  const insertAsset = (asset: AssetRecord) => {
+    addLayerLine(
+      `image "asset:${asset.id}" pos=0.5,0.56 w=0.62 fit=contain radius=24 shadow=0.45 bob=0.012 in=popIn`,
+    );
+  };
+
+  const removeAsset = (asset: AssetRecord) => {
+    const used = assetUsage.get(asset.id) ?? 0;
+    const prompt = used
+      ? `Delete "${asset.name}"? ${used} recipe line(s) use it and will show a placeholder.`
+      : `Delete "${asset.name}" from this browser?`;
+    if (!window.confirm(prompt)) return;
+    void deleteAsset(asset.id);
+    const url = assetUrls.current.get(asset.id);
+    if (url) URL.revokeObjectURL(url);
+    assetUrls.current.delete(asset.id);
+    setAssets((prev) => prev.filter((row) => row.id !== asset.id));
+    setAssetEpoch((v) => v + 1);
+  };
+
+  const patchAsset = (asset: AssetRecord, patch: { name?: string; prompt?: string }) => {
+    setAssets((prev) => prev.map((row) => (row.id === asset.id ? { ...row, ...patch, id: row.id } : row)));
+    void updateAsset(asset.id, patch);
+  };
+
+  /** Swaps the picture behind an existing `asset:` handle, keeping the shot as-is. */
+  const replaceImage = async (file: File | undefined) => {
+    if (!file || !selected || selected.kind !== 'image') return;
+    const record = await putAsset(file);
+    assetUrls.current.set(record.id, URL.createObjectURL(file));
+    setAssets((prev) => [record, ...prev]);
+    setAssetEpoch((v) => v + 1);
+    setSource((prev) => setText(prev, selected, `asset:${record.id}`));
+  };
+
+  /* ------------------------------ keyframing ------------------------------- */
+
+  const baseValue = (layer: Layer, prop: string) => {
+    if (prop === 'x' || prop === 'y') return layer.nums[prop] ?? 0.5;
+    if (prop === 'zoom') return layer.nums.zoom ?? 1;
+    if (prop === 'scale' || prop === 'opacity') return 1;
+    return 0;
+  };
+
+  const keyAtPlayhead = (layer: Layer, prop: string) => {
+    const at = Math.min(playhead.get(), duration);
+    return (layer.keys[prop] ?? []).some((k) => Math.abs(k.t - at) <= 0.05);
+  };
+
+  const toggleKeyAt = (prop: string) => {
+    if (!selected) return;
+    const at = Math.min(playhead.get(), duration);
+    const value = evalKeys(selected.keys[prop], at, baseValue(selected, prop));
+    setSource((prev) => toggleKey(prev, selected, prop, at, value));
+  };
+
+  /* ---------------------------- timeline drag ------------------------------ */
+
+  const onClipMove = useCallback((event: PointerEvent) => {
+    const drag = clipDrag.current;
+    if (!drag) return;
+    const dxPx = event.clientX - drag.startX;
+    if (!drag.moved && Math.abs(dxPx) < 2) return;
+    drag.moved = true;
+
+    const raw = (dxPx / drag.laneWidth) * drag.duration;
+    const threshold = (8 / drag.laneWidth) * drag.duration;
+    const primary = drag.items[0];
+    let dt = raw;
+    let line: number | null = null;
+
+    if (drag.snap && primary) {
+      const recipeNow = recipeRef.current;
+      const points = [playhead.get(), 0, drag.duration];
+      for (const layer of recipeNow.layers) {
+        if (drag.ids.includes(layer.id)) continue;
+        points.push(layer.start, layer.end);
+      }
+      const anchor = drag.mode === 'trim-r' ? primary.end : primary.start;
+      const target = nearestSnap(points, anchor + raw, threshold);
+      if (target !== null) {
+        dt = target - anchor;
+        line = target;
+      }
+    }
+
+    setSnapAt(line);
+
+    const next = drag.items.map((item) => {
+      if (drag.mode === 'move') {
+        const start = Math.max(0, item.start + dt);
+        return { start, end: start + (item.end - item.start) };
+      }
+      if (drag.mode === 'trim-l') {
+        const start = Math.max(0, Math.min(item.start + dt, item.end - 0.1));
+        return { start, end: item.end };
+      }
+      const end = Math.max(item.start + 0.1, item.end + dt);
+      return { start: item.start, end };
+    });
+
+    setSource((prev) =>
+      drag.items.reduce((src, item, i) => setTimeRange(src, item.layer, next[i].start, next[i].end), prev),
+    );
+  }, []);
+
+  const endClipDrag = useCallback(() => {
+    clipDrag.current = null;
+    setSnapAt(null);
+    window.removeEventListener('pointermove', onClipMove);
+    window.removeEventListener('pointerup', endClipDrag);
+  }, [onClipMove]);
+
+  const beginClipDrag = (
+    event: React.PointerEvent<HTMLElement>,
+    layer: Layer,
+    mode: ClipDrag['mode'],
+  ) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+
+    const lane = (event.currentTarget.closest('.track-lane') as HTMLElement | null) ?? null;
+    const laneWidth = lane?.getBoundingClientRect().width ?? 1;
+    const inSelection = selectedIds.includes(layer.id);
+    const ids = inSelection ? selectedIds : [layer.id];
+    if (!inSelection) setSelectedIds([layer.id]);
+    setPlaying(false);
+
+    const items = recipe.layers
+      .filter((l) => ids.includes(l.id))
+      .map((l) => ({ layer: l, start: l.start, end: l.end }));
+    if (!items.length) return;
+
+    clipDrag.current = {
+      mode,
+      startX: event.clientX,
+      laneWidth,
+      duration,
+      snap: snapOn,
+      moved: false,
+      items,
+      ids,
+    };
+    window.addEventListener('pointermove', onClipMove);
+    window.addEventListener('pointerup', endClipDrag);
+  };
+
+  useEffect(() => () => {
+    window.removeEventListener('pointermove', onClipMove);
+    window.removeEventListener('pointerup', endClipDrag);
+  }, [onClipMove, endClipDrag]);
 
   const handleExport = async () => {
     if (exporting) return;
@@ -655,6 +1051,7 @@ export default function App() {
         fps,
         bitrate: 8_000_000,
         audio: audioFile,
+        resolveImage,
         onProgress: (ratio, label) => {
           setProgress(ratio);
           setStage(label);
@@ -679,14 +1076,18 @@ export default function App() {
   };
 
   const sizeValue =
-    selected && selected.kind !== 'text' && selected.nums.w === undefined
+    selected && selected.kind === 'camera'
       ? ''
-      : selected
-        ? Math.round(selected.nums.size ?? selected.nums.w ?? DEFAULT_TEXT_SIZE)
-        : '';
+      : selected && selected.kind !== 'text' && selected.nums.w === undefined
+        ? ''
+        : selected
+          ? selected.kind === 'text'
+            ? Math.round(selected.nums.size ?? DEFAULT_TEXT_SIZE)
+            : selected.nums.w!
+          : '';
 
   return (
-    <div className="app">
+    <div className={`app ${tlOpen ? '' : 'is-tl-collapsed'}`}>
       <header className="topbar">
         <div className="brand">
           <svg className="brand-mark" viewBox="0 0 32 32" aria-hidden="true" focusable="false">
@@ -733,6 +1134,25 @@ export default function App() {
           </label>
         </div>
 
+        <div className="pane-tabs" role="group" aria-label="Panels">
+          <button
+            type="button"
+            className={`btn btn-ghost btn-xs ${pane === 'workspace' ? 'is-on' : ''}`}
+            aria-pressed={pane === 'workspace'}
+            onClick={() => setPane((prev) => (prev === 'workspace' ? null : 'workspace'))}
+          >
+            Script
+          </button>
+          <button
+            type="button"
+            className={`btn btn-ghost btn-xs ${pane === 'inspector' ? 'is-on' : ''}`}
+            aria-pressed={pane === 'inspector'}
+            onClick={() => setPane((prev) => (prev === 'inspector' ? null : 'inspector'))}
+          >
+            Layers
+          </button>
+        </div>
+
         <div className="top-actions">
           {exporting ? (
             <div className="export-progress" role="status" aria-live="polite">
@@ -750,7 +1170,7 @@ export default function App() {
         </div>
       </header>
 
-      <main className="main">
+      <main className="main" data-pane={pane ?? undefined}>
         <section className="panel panel-left" aria-label="Workspace">
           <div className="panel-head">
             <div className="tabs" aria-label="Workspace">
@@ -770,7 +1190,24 @@ export default function App() {
               >
                 Prompt
               </button>
+              <button
+                type="button"
+                aria-pressed={tab === 'media'}
+                className="tab"
+                onClick={() => setTab('media')}
+              >
+                Images
+              </button>
             </div>
+            <button
+              type="button"
+              className="panel-close"
+              onClick={() => setPane(null)}
+              aria-label="Close panel"
+              title="Close panel"
+            >
+              ✕
+            </button>
             {tab === 'recipe' && (
               <div className="panel-head-actions">
                 <button
@@ -797,7 +1234,7 @@ export default function App() {
                   className="btn btn-ghost btn-xs"
                   onClick={() => {
                     setSource(SAMPLE_RECIPE);
-                    setSelectedId(null);
+                    setSelectedIds([]);
                   }}
                 >
                   Sample
@@ -806,7 +1243,7 @@ export default function App() {
                   className="btn btn-ghost btn-xs"
                   onClick={() => {
                     setSource('');
-                    setSelectedId(null);
+                    setSelectedIds([]);
                   }}
                 >
                   Clear
@@ -823,7 +1260,7 @@ export default function App() {
                 value={source}
                 onChange={(e) => {
                   setSource(e.target.value);
-                  setSelectedId(null);
+                  setSelectedIds([]);
                 }}
                 aria-label="Recipe source"
                 placeholder={
@@ -849,8 +1286,18 @@ export default function App() {
                 ))}
               </div>
             </div>
-          ) : (
+          ) : tab === 'prompt' ? (
             <PromptPanel aspect={aspect} fps={fps} onOpenRecipe={() => setTab('recipe')} />
+          ) : (
+            <MediaPanel
+              assets={assets}
+              urls={assetUrls.current}
+              usage={assetUsage}
+              onUpload={addImage}
+              onInsert={insertAsset}
+              onDelete={removeAsset}
+              onUpdate={patchAsset}
+            />
           )}
         </section>
 
@@ -913,8 +1360,18 @@ export default function App() {
               <h2>{selected ? 'Selected' : 'Layers'}</h2>
               <p className="hint">{selected ? layerLabel(selected) : `${layers.length} in this recipe`}</p>
             </div>
+            <button
+              type="button"
+              className="panel-close"
+              onClick={() => setPane(null)}
+              aria-label="Close panel"
+              title="Close panel"
+            >
+              ✕
+            </button>
           </div>
 
+          <div className="panel-body">
           {selected && (
             <div className="inspector">
               {selected.kind === 'text' && (
@@ -933,30 +1390,176 @@ export default function App() {
 
               <div className="inspector-row">
                 <label className="inspector-field">
-                  <span>{selected.kind === 'text' ? 'Size' : 'Width'}</span>
+                  <span>X</span>
                   <input
                     type="number"
-                    min={1}
-                    value={sizeValue}
+                    step={0.005}
+                    value={(selected.nums.x ?? 0.5).toFixed(3)}
                     onChange={(e) => {
                       const value = Number(e.target.value);
-                      if (!Number.isFinite(value) || value < 1) return;
-                      const key = selected.kind === 'text' ? 'size' : 'w';
-                      setSource((prev) => setProp(prev, selected, key, String(Math.round(value))));
+                      if (!Number.isFinite(value)) return;
+                      setSource((prev) => setPosition(prev, selected, value, selected.nums.y ?? 0.5));
                     }}
                   />
                 </label>
+                <label className="inspector-field">
+                  <span>Y</span>
+                  <input
+                    type="number"
+                    step={0.005}
+                    value={(selected.nums.y ?? 0.5).toFixed(3)}
+                    onChange={(e) => {
+                      const value = Number(e.target.value);
+                      if (!Number.isFinite(value)) return;
+                      setSource((prev) => setPosition(prev, selected, selected.nums.x ?? 0.5, value));
+                    }}
+                  />
+                </label>
+              </div>
 
-                <div className="inspector-field">
-                  <span>Stack</span>
-                  <div className="inspector-buttons">
-                    <button type="button" onClick={bringForward} title="Bring forward">
-                      ↑
-                    </button>
-                    <button type="button" onClick={sendBackward} title="Send backward">
-                      ↓
-                    </button>
+              {selected.kind === 'camera' ? (
+                <div className="inspector-row">
+                  <label className="inspector-field">
+                    <span>Zoom</span>
+                    <input
+                      type="number"
+                      step={0.01}
+                      min={0.5}
+                      max={3}
+                      value={(selected.nums.zoom ?? 1).toFixed(2)}
+                      onChange={(e) => {
+                        const value = Number(e.target.value);
+                        if (!Number.isFinite(value)) return;
+                        setSource((prev) => setNumber(prev, selected, 'zoom', value));
+                      }}
+                    />
+                  </label>
+                  <div className="inspector-field">
+                    <span>Depth</span>
+                    <input
+                      type="number"
+                      step={0.05}
+                      min={0}
+                      max={1}
+                      value={(selected.nums.d ?? 1).toFixed(2)}
+                      onChange={(e) => {
+                        const value = Number(e.target.value);
+                        if (!Number.isFinite(value)) return;
+                        setSource((prev) => setNumber(prev, selected, 'd', value));
+                      }}
+                    />
                   </div>
+                </div>
+              ) : (
+                <div className="inspector-row">
+                  <label className="inspector-field">
+                    <span>{selected.kind === 'text' ? 'Size' : 'Width'}</span>
+                    <input
+                      type="number"
+                      min={selected.kind === 'text' ? 1 : 0.005}
+                      step={selected.kind === 'text' ? 1 : 0.01}
+                      value={sizeValue}
+                      onChange={(e) => {
+                        const value = Number(e.target.value);
+                        if (!Number.isFinite(value) || value <= 0) return;
+                        if (selected.kind === 'text') {
+                          setSource((prev) => setProp(prev, selected, 'size', String(Math.round(value))));
+                          return;
+                        }
+                        setSource((prev) => setNumber(prev, selected, 'w', value));
+                      }}
+                    />
+                  </label>
+
+                  <div className="inspector-field">
+                    <span>Stack</span>
+                    <div className="inspector-buttons">
+                      <button type="button" onClick={bringForward} title="Bring forward">
+                        ↑
+                      </button>
+                      <button type="button" onClick={sendBackward} title="Send backward">
+                        ↓
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {selected.kind === 'image' && (
+                <>
+                  <div className="asset-card">
+                    <span
+                      className={`asset-thumb ${selectedAssetUrl ? '' : 'is-missing'}`}
+                      style={selectedAssetUrl ? { backgroundImage: `url("${selectedAssetUrl}")` } : undefined}
+                      aria-hidden="true"
+                    />
+                    <div className="asset-meta">
+                      <strong>{selectedAsset?.name ?? 'Image not in this browser'}</strong>
+                      <code>asset:{selectedAssetId ?? '—'}</code>
+                      <span>
+                        {selectedAsset
+                          ? `used in ${assetUsage.get(selectedAsset.id) ?? 0} line(s)`
+                          : 'the recipe still has the handle; upload it again to fill the frame'}
+                      </span>
+                    </div>
+                    <label className="btn btn-ghost btn-xs asset-replace">
+                      Replace
+                      <input
+                        type="file"
+                        accept="image/*"
+                        hidden
+                        onChange={(e) => {
+                          void replaceImage(e.target.files?.[0]);
+                          e.currentTarget.value = '';
+                        }}
+                      />
+                    </label>
+                  </div>
+
+                  <label className="inspector-field">
+                    <span>Fit</span>
+                    <select
+                      value={selected.props.fit ?? 'contain'}
+                      onChange={(e) => setSource((prev) => setProp(prev, selected, 'fit', e.target.value))}
+                    >
+                      <option value="contain">Contain — whole picture, letterboxed</option>
+                      <option value="cover">Cover — fill the box, crop the rest</option>
+                      <option value="fill">Fill — stretch to the box</option>
+                    </select>
+                  </label>
+                </>
+              )}
+
+              {selected.kind !== 'camera' && selected.kind !== 'scene' && (
+                <label className="inspector-field">
+                  <span>Reveal</span>
+                  <select
+                    value={selected.props.reveal ?? 'none'}
+                    onChange={(e) => setSource((prev) => setProp(prev, selected, 'reveal', e.target.value))}
+                  >
+                    <option value="none">None</option>
+                    <option value="left">Wipe from left</option>
+                    <option value="right">Wipe from right</option>
+                    <option value="up">Wipe up</option>
+                    <option value="down">Wipe down</option>
+                  </select>
+                </label>
+              )}
+
+              <div className="inspector-field">
+                <span>Key at playhead</span>
+                <div className="key-row">
+                  {(selected.kind === 'camera' ? ['zoom', 'x', 'y'] : ['x', 'y', 'scale', 'opacity']).map((prop) => (
+                    <button
+                      key={prop}
+                      type="button"
+                      className={`key-chip ${keyAtPlayhead(selected, prop) ? 'is-on' : ''}`}
+                      onClick={() => toggleKeyAt(prop)}
+                      title={`Add or remove a ${prop} key at ${formatTime(time)}`}
+                    >
+                      {prop}
+                    </button>
+                  ))}
                 </div>
               </div>
 
@@ -969,7 +1572,7 @@ export default function App() {
                 className={`btn btn-xs inspector-delete ${confirmDelete ? 'is-confirming' : ''}`}
                 onClick={removeSelected}
               >
-                {confirmDelete ? 'Really delete?' : 'Delete layer'}
+                {confirmDelete ? 'Really delete?' : selectedIds.length > 1 ? `Delete ${selectedIds.length} layers` : 'Delete layer'}
               </button>
             </div>
           )}
@@ -979,17 +1582,23 @@ export default function App() {
               <LayerRow
                 key={layer.id}
                 layer={layer}
-                selected={layer.id === selectedId}
+                selected={selectedSet.has(layer.id)}
                 onSelect={selectLayer}
               />
             ))}
             {layers.length === 0 && <li className="layer-empty">No layers yet.</li>}
           </ul>
+          </div>
 
           <div className="panel-foot">
             {done && <p className="note note-ok">Exported · {done}</p>}
             {notice && <p className="note note-warn">{notice}</p>}
             {error && <p className="note note-error">{error}</p>}
+            {assets.length > 0 && (
+              <p className="note asset-note">
+                {assets.length} image{assets.length === 1 ? '' : 's'} in this browser
+              </p>
+            )}
             {!exportable && (
               <p className="note note-warn">This browser has no WebCodecs. Open in Chrome or Edge to export.</p>
             )}
@@ -997,37 +1606,200 @@ export default function App() {
         </aside>
       </main>
 
-      <footer className="timeline" aria-label="Timeline">
-        <div className="ruler">
-          {Array.from({ length: Math.floor(duration) + 1 }).map((_, i) => (
-            <span key={i} className="tick" style={{ left: `${(i / Math.max(1, duration)) * 100}%` }}>
-              {i}s
-            </span>
-          ))}
-          <TimelinePlayhead duration={duration} />
+      {pane && <button className="pane-scrim" aria-label="Close panel" onClick={() => setPane(null)} />}
+
+      <footer className={`timeline ${tlOpen ? '' : 'is-collapsed'}`} aria-label="Timeline">
+        <div className="tl-bar">
+          <div className="tl-add">
+            <span className="tl-add-label">Add</span>
+            <button
+              type="button"
+              className="btn btn-ghost btn-xs"
+              onClick={() => addLayerLine('text "New line" pos=0.5,0.5 size=96 in=charIn')}
+            >
+              + Text
+            </button>
+            <button
+              type="button"
+              className="btn btn-ghost btn-xs"
+              onClick={() =>
+                addLayerLine('shape rect pos=0.5,0.5 w=0.3 h=0.12 radius=18 color=#5A63C4 in=popIn')
+              }
+            >
+              + Shape
+            </button>
+            <button
+              type="button"
+              className="btn btn-ghost btn-xs"
+              onClick={() => addLayerLine('card pos=0.5,0.5 w=0.52 h=0.3 radius=28 shadow=0.5 in=slideU')}
+            >
+              + Card
+            </button>
+            <label className="btn btn-ghost btn-xs add-file">
+              + Image
+              <input
+                type="file"
+                accept="image/*"
+                multiple
+                hidden
+                onChange={(e) => {
+                  void addImage(e.target.files ?? undefined);
+                  e.currentTarget.value = '';
+                }}
+              />
+            </label>
+            <button
+              type="button"
+              className="btn btn-ghost btn-xs"
+              onClick={() => addLayerLine('camera x=0.5 y=0.5 zoom=1.03')}
+            >
+              + Camera
+            </button>
+          </div>
+
+          <div className="tl-tools">
+            <div className="tl-zoom" role="group" aria-label="Timeline zoom">
+              <button
+                type="button"
+                className="tl-zoom-btn"
+                onClick={() => zoomBy(1 / 1.6)}
+                disabled={zoom <= 1}
+                aria-label="Zoom out"
+                title="Zoom out"
+              >
+                −
+              </button>
+              <button
+                type="button"
+                className="tl-zoom-value"
+                onClick={() => setZoom(1)}
+                title="Back to fit"
+              >
+                {zoom <= 1.001 ? 'Fit' : `${zoom.toFixed(1)}×`}
+              </button>
+              <button
+                type="button"
+                className="tl-zoom-btn"
+                onClick={() => zoomBy(1.6)}
+                disabled={zoom >= 8}
+                aria-label="Zoom in"
+                title="Zoom in"
+              >
+                +
+              </button>
+            </div>
+            <span className="tl-time">{formatTime(time)}</span>
+            <button
+              type="button"
+              className={`btn btn-ghost btn-xs addbar-snap ${snapOn ? 'is-on' : ''}`}
+              aria-pressed={snapOn}
+              onClick={() => setSnapOn((v) => !v)}
+              title="Snap cuts to the playhead and to other cuts"
+            >
+              Snap
+            </button>
+            <button
+              type="button"
+              className="tl-collapse"
+              onClick={() => setTlOpen((v) => !v)}
+              aria-expanded={tlOpen}
+              aria-label={tlOpen ? 'Collapse timeline' : 'Expand timeline'}
+              title={tlOpen ? 'Collapse timeline' : 'Expand timeline'}
+            >
+              {tlOpen ? '▾' : '▴'}
+            </button>
+          </div>
         </div>
 
-        <div className="tracks">
-          {layers.map((layer) => {
-            const left = (layer.start / Math.max(0.1, duration)) * 100;
-            const width = ((layer.end - layer.start) / Math.max(0.1, duration)) * 100;
-            return (
-              <div
-                className={`track ${layer.id === selectedId ? 'is-selected' : ''}`}
-                key={`t-${layer.id}`}
-                onClick={() => setSelectedId(layer.id)}
-              >
-                <span className="track-label">
-                  <span className={`dot dot-${layer.kind}`} aria-hidden="true" />
-                  {layer.kind === 'text' ? layer.text.slice(0, 28) || 'Text' : `${KIND_LABEL[layer.kind]}${layer.shape ? ` · ${layer.shape}` : ''}`}
-                </span>
-                <div className="track-lane">
-                  <div className={`clip clip-${layer.kind}`} style={{ left: `${left}%`, width: `${Math.max(0.6, width)}%` }} />
-                </div>
+        <div className="tl-scroll" ref={tlScrollRef}>
+          <div className="tl-content" style={{ width: tlBox.label + contentW }}>
+            <div className="tl-row tl-ruler-row">
+              <div className="tl-corner">
+                <span className="tl-corner-time">{formatTime(time)}</span>
+                <span className="tl-corner-meta">{layers.length} layers</span>
               </div>
-            );
-          })}
-          {layers.length === 0 && <p className="track-empty">Nothing on the timeline yet.</p>}
+              <div
+                className="ruler"
+                style={
+                  {
+                    width: contentW,
+                    '--minor': `${Math.max(10, (tickStep * pxPerSec) / 4)}px`,
+                  } as React.CSSProperties
+                }
+                onPointerDown={seekFromRuler}
+                role="slider"
+                tabIndex={0}
+                aria-label="Timeline ruler"
+                aria-valuemin={0}
+                aria-valuemax={Math.round(duration)}
+                aria-valuenow={Number(time.toFixed(2))}
+                onKeyDown={(event) => {
+                  if (event.key === 'ArrowLeft') seekTo(time - (event.shiftKey ? 1 : 0.1));
+                  if (event.key === 'ArrowRight') seekTo(time + (event.shiftKey ? 1 : 0.1));
+                }}
+              >
+                {ticks.map((t) => (
+                  <span key={t} className="tick" style={{ left: t * pxPerSec, transform: t === 0 ? 'none' : undefined }}>
+                    {tickLabel(t)}
+                  </span>
+                ))}
+              </div>
+            </div>
+
+            {layers.map((layer) => {
+              const thumb = layer.kind === 'image' && layer.text.startsWith('asset:')
+                ? assetUrls.current.get(layer.text.slice(6))
+                : undefined;
+              return (
+                <div
+                  className={`tl-row track ${selectedSet.has(layer.id) ? 'is-selected' : ''}`}
+                  key={`t-${layer.id}`}
+                  onClick={(event) => selectLayer(layer, event.shiftKey)}
+                >
+                  <div className="track-label">
+                    <span className={`dot dot-${layer.kind}`} aria-hidden="true" />
+                    <span className="track-name">{layerLabel(layer)}</span>
+                    <span className="track-dur">{formatTime(layer.end - layer.start)}</span>
+                  </div>
+                  <div
+                    className="track-lane"
+                    style={{ width: contentW }}
+                    onPointerDown={(event) => {
+                      if (event.target === event.currentTarget) setSelectedIds([]);
+                    }}
+                  >
+                    <div
+                      className={`clip clip-${layer.kind}`}
+                      style={{
+                        left: layer.start * pxPerSec,
+                        width: Math.max(10, (layer.end - layer.start) * pxPerSec),
+                      }}
+                      onPointerDown={(event) => beginClipDrag(event, layer, 'move')}
+                      title={`${formatTime(layer.start)} → ${formatTime(layer.end)}`}
+                    >
+                      <span
+                        className="clip-grip grip-l"
+                        onPointerDown={(event) => beginClipDrag(event, layer, 'trim-l')}
+                      />
+                      <span
+                        className="clip-grip grip-r"
+                        onPointerDown={(event) => beginClipDrag(event, layer, 'trim-r')}
+                      />
+                      {thumb && <span className="clip-thumb" style={{ backgroundImage: `url("${thumb}")` }} />}
+                      <span className="clip-name">{layerLabel(layer)}</span>
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+
+            {layers.length === 0 && <p className="track-empty">Nothing on the timeline yet.</p>}
+
+            <TimelineCursor duration={duration} pxPerSec={pxPerSec} labelW={tlBox.label} />
+            {snapAt !== null && (
+              <div className="snap-line" style={{ left: tlBox.label + snapAt * pxPerSec }} />
+            )}
+          </div>
         </div>
       </footer>
     </div>
@@ -1043,17 +1815,48 @@ function LayerRow({
 }: {
   layer: Layer;
   selected: boolean;
-  onSelect: (layer: Layer) => void;
+  onSelect: (layer: Layer, additive?: boolean) => void;
 }) {
   const live = usePlayheadIn(layer.start, layer.end);
   return (
     <li
       className={`layer-row ${live ? 'is-live' : ''} ${selected ? 'is-selected' : ''}`}
-      onClick={() => onSelect(layer)}
+      onClick={(event) => onSelect(layer, event.shiftKey)}
     >
       <span className={`dot dot-${layer.kind}`} aria-hidden="true" />
       <span className="layer-name">{layerLabel(layer)}</span>
       <span className="layer-time">{formatTime(layer.start)}</span>
     </li>
+  );
+}
+
+/** Ruler label: seconds until a minute, then m:ss. */
+function tickLabel(seconds: number) {
+  if (seconds >= 60) {
+    const minutes = Math.floor(seconds / 60);
+    const rest = Math.round(seconds % 60);
+    return `${minutes}:${String(rest).padStart(2, '0')}`;
+  }
+  return Number.isInteger(seconds) ? `${seconds}s` : `${Number(seconds.toFixed(2))}s`;
+}
+
+/**
+ * The playhead subscribes to the clock directly, so dragging or playing moves a
+ * single 1 px line instead of re-rendering the whole timeline.
+ */
+function TimelineCursor({
+  duration,
+  pxPerSec,
+  labelW,
+}: {
+  duration: number;
+  pxPerSec: number;
+  labelW: number;
+}) {
+  const at = Math.min(usePlayhead(), duration);
+  return (
+    <div className="tl-cursor" style={{ left: labelW + at * pxPerSec }} aria-hidden="true">
+      <span className="tl-cursor-head" />
+    </div>
   );
 }

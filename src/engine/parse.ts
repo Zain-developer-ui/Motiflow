@@ -8,10 +8,14 @@ const KINDS: Record<string, LayerKind> = {
   text: 'text',
   shape: 'shape',
   card: 'card',
+  image: 'image',
   camera: 'camera',
 };
 
 const SHAPES: ShapeKind[] = ['rect', 'circle', 'pill', 'ring', 'line', 'check', 'arrow'];
+
+const REVEALS = ['left', 'right', 'up', 'down'];
+const FITS = ['contain', 'cover', 'fill'];
 
 const ANIMS: AnimName[] = [
   'charIn',
@@ -198,7 +202,7 @@ export function parseRecipe(source: string): Recipe {
     if (!kind) {
       issues.push({
         line: lineNo,
-        message: `Unknown element "${tokens[0]}" — use scene, text, shape, card or camera`,
+        message: `Unknown element "${tokens[0]}" — use scene, text, shape, card, image or camera`,
         severity: 'error',
       });
       return;
@@ -309,6 +313,22 @@ export function parseRecipe(source: string): Recipe {
         case 'follow':
           props.follow = value;
           break;
+        case 'fit': {
+          const fit = value.toLowerCase();
+          if (!FITS.includes(fit)) {
+            issues.push({ line: lineNo, message: `Unknown fit "${value}" — use contain, cover or fill`, severity: 'warn' });
+          }
+          props.fit = fit;
+          break;
+        }
+        case 'reveal': {
+          const reveal = value.toLowerCase();
+          if (!REVEALS.includes(reveal)) {
+            issues.push({ line: lineNo, message: `Unknown reveal "${value}" — use left, right, up or down`, severity: 'warn' });
+          }
+          props.reveal = reveal;
+          break;
+        }
         default: {
           props[key] = value;
           const n = num(value);

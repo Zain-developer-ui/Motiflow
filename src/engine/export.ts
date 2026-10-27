@@ -9,6 +9,8 @@ export interface ExportOptions {
   fps: number;
   bitrate?: number;
   audio?: File | null;
+  /** Resolves `asset:` handles so image layers render in the exported file. */
+  resolveImage?: (src: string) => HTMLImageElement | null;
   onProgress?: (ratio: number, stage: string) => void;
   signal?: AbortSignal;
 }
@@ -71,7 +73,7 @@ export async function exportMp4(options: ExportOptions): Promise<ExportResult> {
   const ctx = canvas.getContext('2d', { alpha: false });
   if (!ctx) throw new Error('Could not create a drawing surface.');
 
-  const scene = createScene(recipe, { width, height });
+  const scene = createScene(recipe, { width, height }, { resolveImage: options.resolveImage });
 
   const target = new ArrayBufferTarget();
   const muxer = new Muxer({

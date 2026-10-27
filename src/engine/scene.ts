@@ -1,5 +1,5 @@
 import { clamp01, easeOutBack, easeOutCubic, evalKeys, lerp, progressBetween } from './easing';
-import { fillFor, firstColor, splitTopLevel } from './paint';
+import { fillFor, firstColor, splitTopLevel, withAlpha } from './paint';
 import type { Layer, Recipe } from './types';
 
 const FAMILIES: Record<string, string> = {
@@ -13,6 +13,21 @@ export interface SceneSize {
   width: number;
   height: number;
 }
+
+export interface SceneOptions {
+  /** Resolves `asset:<id>` (or any URL) to a decoded image. Missing images draw a placeholder. */
+  resolveImage?: (src: string) => HTMLImageElement | null;
+}
+
+/** One-line palettes for `scene theme=…`, so a section recolours with a word. */
+const THEMES: Record<string, { bg: string; accent: string }> = {
+  warm: { bg: '#FBF3E7', accent: '#E8B23A' },
+  mint: { bg: '#EAF4EE', accent: '#4FA97B' },
+  lilac: { bg: '#F1EEFB', accent: '#7C6BD6' },
+  sand: { bg: '#F4EFE6', accent: '#B98A4B' },
+  night: { bg: '#0F1012', accent: '#8B93F8' },
+  paper: { bg: '#FBFAF8', accent: '#5A63C4' },
+};
 
 /**
  * Pixel values are authored against the SHORT side of a 1080 frame, so a
@@ -51,6 +66,8 @@ interface Glyph {
   ch: string;
   index: number;
   word: number;
+  /** Advance width in px, measured once when the line is laid out. */
+  w: number;
 }
 
 interface Line {
@@ -62,13 +79,89 @@ interface Line {
 const SHAPING_SCRIPT = /[\u0900-\u0D7F\u0E00-\u0E7F\u1000-\u109F]/;
 
 /**
+ * Line layouts, keyed by font + wrap width + text. Without this every painted
+ * frame re-runs `measureText` for the space, each word and each character.
+ */
+const layoutCache = new Map<string, { lines: Line[]; total: number; words: number }>();
+const LAYOUT_CACHE_MAX = 240;
+
+// Web fonts change advance widths. A layout measured against the fallback face
+// before the font arrived would stay wrong for the life of the page, so drop the
+// cache whenever a font finishes loading.
+if (typeof document !== 'undefined' && document.fonts) {
+  const clearLayouts = () => layoutCache.clear();
+  document.fonts.addEventListener('loadingdone', clearLayouts);
+  document.fonts.addEventListener('loadingerror', clearLayouts);
+}
+
+/**
+ * Rounded-corner copies of images, keyed by asset + drawn size + radius.
+ * Baking the corners into an offscreen lets a shadow follow the real alpha
+ * silhouette instead of being cut off by the clip path.
+ */
+const roundedCache = new Map<string, HTMLCanvasElement>();
+
+function roundedImage(
+  img: HTMLImageElement,
+  w: number,
+  h: number,
+  radius: number,
+  key: string,
+): HTMLCanvasElement {
+  const id = `${key}|${Math.round(w)}x${Math.round(h)}|${Math.round(radius)}`;
+  const hit = roundedCache.get(id);
+  if (hit) return hit;
+
+  const canvas = document.createElement('canvas');
+  canvas.width = Math.max(1, Math.round(w));
+  canvas.height = Math.max(1, Math.round(h));
+  const ctx = canvas.getContext('2d');
+  if (ctx) {
+    const r = Math.max(0, Math.min(radius, canvas.width / 2, canvas.height / 2));
+    ctx.beginPath();
+    if (typeof ctx.roundRect === 'function') ctx.roundRect(0, 0, canvas.width, canvas.height, r);
+    else ctx.rect(0, 0, canvas.width, canvas.height);
+    ctx.clip();
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+  }
+
+  roundedCache.set(id, canvas);
+  if (roundedCache.size > 32) {
+    const oldest = roundedCache.keys().next().value;
+    if (oldest) roundedCache.delete(oldest);
+  }
+  return canvas;
+}
+
+/**
+ * Sets the font for measuring and drawing.
+ *
+ * Kerning is off on purpose: a whole-string `fillText` is narrower than the sum
+ * of its glyph advances when kerning is on, so a batched run would jump a pixel
+ * or two against the per-glyph reveal. Unkerned runs match exactly.
+ */
+function setFont(ctx: CanvasRenderingContext2D, css: string) {
+  ctx.font = css;
+  if ('fontKerning' in ctx) ctx.fontKerning = 'none';
+}
+
+/**
  * Wraps text into lines, respecting hard `\n` breaks.
  *
  * Latin text is cut into glyphs so `charIn` can reveal it letter by letter.
  * Devanagari (and other shaping scripts) is cut into words instead: a matra or
  * a conjunct only renders correctly when the whole word is drawn at once.
  */
-function layoutText(ctx: CanvasRenderingContext2D, text: string, maxWidth: number): { lines: Line[]; total: number; words: number } {
+function layoutText(
+  ctx: CanvasRenderingContext2D,
+  text: string,
+  maxWidth: number,
+  font: string,
+): { lines: Line[]; total: number; words: number } {
+  const key = `${font}\u0000${Math.round(maxWidth * 100)}\u0000${text}`;
+  const cached = layoutCache.get(key);
+  if (cached) return cached;
+
   const spaceWidth = ctx.measureText(' ').width;
   const perWord = SHAPING_SCRIPT.test(text);
   const lines: Line[] = [];
@@ -94,16 +187,17 @@ function layoutText(ctx: CanvasRenderingContext2D, text: string, maxWidth: numbe
         currentWidth = 0;
       }
       if (current.length > 0) {
-        current.push({ ch: ' ', index: index++, word: wordCount });
+        current.push({ ch: ' ', index: index++, word: wordCount, w: spaceWidth });
         currentWidth += spaceWidth;
       }
       if (perWord) {
-        current.push({ ch: word, index: index++, word: wordCount });
+        current.push({ ch: word, index: index++, word: wordCount, w: wordWidth });
         currentWidth += wordWidth;
       } else {
         for (const ch of word) {
-          current.push({ ch, index: index++, word: wordCount });
-          currentWidth += ctx.measureText(ch).width;
+          const chWidth = ctx.measureText(ch).width;
+          current.push({ ch, index: index++, word: wordCount, w: chWidth });
+          currentWidth += chWidth;
         }
       }
       wordCount++;
@@ -112,7 +206,11 @@ function layoutText(ctx: CanvasRenderingContext2D, text: string, maxWidth: numbe
     if (current.length > 0) lines.push({ glyphs: current, width: currentWidth });
   }
 
-  return { lines, total: Math.max(1, index), words: Math.max(1, wordCount) };
+  const layout = { lines, total: Math.max(1, index), words: Math.max(1, wordCount) };
+  // A count-up layer makes a new string every frame; clear instead of growing.
+  if (layoutCache.size >= LAYOUT_CACHE_MAX) layoutCache.clear();
+  layoutCache.set(key, layout);
+  return layout;
 }
 
 function charProgress(elapsed: number, i: number, total: number, inDur: number): number {
@@ -129,10 +227,20 @@ function wordProgress(elapsed: number, word: number, total: number, inDur: numbe
   return clamp01((elapsed - startAt) / dur);
 }
 
-export function createScene(recipe: Recipe, size: SceneSize) {
+export function createScene(recipe: Recipe, size: SceneSize, options: SceneOptions = {}) {
   const W = size.width;
   const H = size.height;
   const scaleUnit = Math.min(W, H) / REFERENCE_SHORT_SIDE;
+  const resolveImage = options.resolveImage;
+
+  // Draw order is fixed for the life of a scene — `z` comes from the recipe and a
+  // new recipe builds a new scene. Sorting once here keeps the paint loop free of
+  // per-frame filter/sort allocations.
+  const drawOrder = recipe.layers
+    .filter((l) => l.kind !== 'scene' && l.kind !== 'camera')
+    .sort((a, b) => a.z - b.z || a.start - b.start);
+  const cameraLayers = recipe.layers.filter((l) => l.kind === 'camera');
+  const sceneLayers = recipe.layers.filter((l) => l.kind === 'scene');
 
   /**
    * Resolution-independent sizing.
@@ -150,7 +258,8 @@ export function createScene(recipe: Recipe, size: SceneSize) {
   const measureCtx = document.createElement('canvas').getContext('2d');
 
   function drawScene(ctx: CanvasRenderingContext2D, layer: Layer) {
-    ctx.fillStyle = layer.props.bg ?? '#0B0F14';
+    const theme = THEMES[(layer.props.theme ?? '').toLowerCase()];
+    ctx.fillStyle = layer.props.bg ?? theme?.bg ?? '#0B0F14';
     ctx.fillRect(0, 0, W, H);
 
     const grid = layer.props.grid;
@@ -170,10 +279,13 @@ export function createScene(recipe: Recipe, size: SceneSize) {
       ctx.stroke();
     }
 
-    const accent = layer.props.accent;
+    const accent = layer.props.accent ?? theme?.accent;
+    // A theme accent is a *tint*, not a paint bucket: a fully opaque radial over
+    // a cream background turns the whole frame muddy. `wash=` overrides either way.
+    const wash = layer.nums.wash ?? (layer.props.accent ? 1 : 0.2);
     if (accent && !isTransparent(accent)) {
-      const g = ctx.createRadialGradient(W * 0.5, H * 0.2, 0, W * 0.5, H * 0.2, Math.max(W, H) * 0.7);
-      g.addColorStop(0, accent);
+      const g = ctx.createRadialGradient(W * 0.5, H * 0.22, 0, W * 0.5, H * 0.22, Math.max(W, H) * 0.62);
+      g.addColorStop(0, withAlpha(accent, Math.min(1, Math.max(0, wash))));
       g.addColorStop(1, 'rgba(0,0,0,0)');
       ctx.fillStyle = g;
       ctx.fillRect(0, 0, W, H);
@@ -186,6 +298,24 @@ export function createScene(recipe: Recipe, size: SceneSize) {
       g.addColorStop(1, `rgba(0,0,0,${Math.min(1, vignette)})`);
       ctx.fillStyle = g;
       ctx.fillRect(0, 0, W, H);
+    }
+
+    // Diagonal stripes: the cheap "printed paper" texture the reference reel
+    // leans on. Drawn once per frame as a single stroked path, no pattern tile.
+    if ((layer.props.texture ?? '').toLowerCase() === 'stripes') {
+      const gap = Math.max(18, W * 0.028);
+      const alpha = Math.min(0.4, Math.max(0.01, layer.nums.textureOpacity ?? 0.05));
+      ctx.save();
+      ctx.globalAlpha = alpha;
+      ctx.strokeStyle = layer.props.textureColor ?? '#000000';
+      ctx.lineWidth = Math.max(2, W * 0.0035);
+      ctx.beginPath();
+      for (let x = -H; x < W + H; x += gap) {
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x + H, H);
+      }
+      ctx.stroke();
+      ctx.restore();
     }
   }
 
@@ -237,15 +367,15 @@ export function createScene(recipe: Recipe, size: SceneSize) {
     const { sizePx, css } = fontFor(layer);
     const maxWidth = dim(layer.nums.w, W, W * 0.8);
     if (!measureCtx) return { sizePx, css, maxWidth, lineWidth: maxWidth, height: sizePx * 1.16 };
-    measureCtx.font = css;
-    const { lines } = layoutText(measureCtx, textContent(layer, t), maxWidth);
+    setFont(measureCtx, css);
+    const { lines } = layoutText(measureCtx, textContent(layer, t), maxWidth, css);
     const lineWidth = lines.reduce((max, line) => Math.max(max, line.width), 0);
     return { sizePx, css, maxWidth, lineWidth, height: lines.length * sizePx * 1.16 };
   }
 
   function drawText(ctx: CanvasRenderingContext2D, layer: Layer, t: number, alpha: number, inE: number) {
     const { sizePx, css } = fontFor(layer);
-    ctx.font = css;
+    setFont(ctx, css);
 
     const maxWidth = dim(layer.nums.w, W, W * 0.8);
     const lineHeight = sizePx * 1.16;
@@ -255,7 +385,7 @@ export function createScene(recipe: Recipe, size: SceneSize) {
 
     const content = textContent(layer, t);
 
-    const { lines, total, words } = layoutText(ctx, content, maxWidth);
+    const { lines, total, words } = layoutText(ctx, content, maxWidth, css);
     const totalHeight = lines.length * lineHeight;
 
     const elapsed = t - layer.start;
@@ -264,6 +394,7 @@ export function createScene(recipe: Recipe, size: SceneSize) {
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.fillStyle = layer.props.color ?? '#F4F2EE';
+    ctx.globalAlpha = alpha;
 
     let y = -totalHeight / 2 + lineHeight / 2;
     for (const line of lines) {
@@ -273,8 +404,23 @@ export function createScene(recipe: Recipe, size: SceneSize) {
           : align === 'right'
             ? maxWidth / 2 - line.width
             : -line.width / 2;
+
+      // Glyphs that have finished animating share a baseline, so they go out as
+      // one `fillText` instead of one call per character. On a 1080 frame this
+      // is the difference between ~30 glyph calls and 2-3 runs per text layer.
+      let run = '';
+      let runX = 0;
+      let runW = 0;
+      let runY = 0;
+      const flush = () => {
+        if (!run) return;
+        ctx.fillText(run, runX + runW / 2, runY);
+        run = '';
+        runW = 0;
+      };
+
       for (const glyph of line.glyphs) {
-        const gw = ctx.measureText(glyph.ch).width;
+        const gw = glyph.w;
         let p = 1;
         let rise = 0;
 
@@ -293,12 +439,27 @@ export function createScene(recipe: Recipe, size: SceneSize) {
           if (mode === 'riseIn') rise = (1 - inE) * sizePx * 0.5;
         }
 
-        if (p > 0.002) {
+        const cy = y - rise;
+        if (p > 0.998) {
+          if (run && cy !== runY) flush();
+          if (!run) {
+            runX = x;
+            runY = cy;
+          }
+          run += glyph.ch;
+          runW += gw;
+        } else if (p > 0.002) {
+          flush();
           ctx.globalAlpha = alpha * p;
-          ctx.fillText(glyph.ch, x + gw / 2, y - rise);
+          ctx.fillText(glyph.ch, x + gw / 2, cy);
+          ctx.globalAlpha = alpha;
+        } else {
+          flush();
         }
         x += gw;
       }
+
+      flush();
       y += lineHeight;
     }
     ctx.globalAlpha = alpha;
@@ -475,6 +636,102 @@ export function createScene(recipe: Recipe, size: SceneSize) {
     }
   }
 
+  /** Source resolution and the on-canvas box for an image layer. */
+  function imageBox(layer: Layer) {
+    const img = resolveImage ? resolveImage(layer.text) : null;
+    const natW = img && img.naturalWidth ? img.naturalWidth : 1600;
+    const natH = img && img.naturalHeight ? img.naturalHeight : 900;
+    const aspect = natH / natW;
+
+    const wantW = dim(layer.nums.w, W, W * 0.6);
+    const wantH = layer.nums.h !== undefined ? dim(layer.nums.h, W, wantW * aspect) : wantW * aspect;
+    const fit = (layer.props.fit ?? 'contain').toLowerCase();
+
+    let w = wantW;
+    let h = wantH;
+    if (fit === 'cover') {
+      const s = Math.max(wantW / natW, wantH / natH);
+      w = natW * s;
+      h = natH * s;
+    } else if (fit !== 'fill') {
+      const s = Math.min(wantW / natW, wantH / natH);
+      w = natW * s;
+      h = natH * s;
+    }
+
+    return { img, w, h, boxW: wantW, boxH: wantH, fit };
+  }
+
+  function drawImageLayer(ctx: CanvasRenderingContext2D, layer: Layer, t: number) {
+    const { img, w, h, boxW, boxH, fit } = imageBox(layer);
+    const radius = dim(layer.nums.radius, W, 0);
+    const clipW = fit === 'cover' ? boxW : w;
+    const clipH = fit === 'cover' ? boxH : h;
+    const shadow = layer.nums.shadow ?? 0;
+    const bob = layer.nums.bob ?? 0;
+    const bobY = bob ? Math.sin(((t - layer.start) / 1.8) * Math.PI * 2) * bob * scaleUnit : 0;
+
+    if (!img || !img.complete || img.naturalWidth === 0) {
+      // Dashed placeholder: the layout stays honest before the asset resolves.
+      ctx.save();
+      ctx.strokeStyle = 'rgba(244,242,238,0.32)';
+      ctx.setLineDash([10 * scaleUnit, 8 * scaleUnit]);
+      ctx.lineWidth = Math.max(1.5, 2 * scaleUnit);
+      roundRectPath(ctx, boxW, boxH, radius || 10 * scaleUnit);
+      ctx.stroke();
+      ctx.restore();
+      return;
+    }
+
+    ctx.save();
+    // Shadow rides on the image's own alpha. Filling a rect behind it would
+    // darken every transparent pixel (SVG characters are mostly transparent).
+    if (shadow > 0 && (radius <= 0 || fit === 'cover')) {
+      ctx.shadowColor = 'rgba(0,0,0,0.45)';
+      ctx.shadowBlur = shadow * 40;
+      ctx.shadowOffsetY = shadow * 14;
+    }
+
+    if (radius > 0 && fit !== 'cover') {
+      // Rounded corners are baked into an offscreen so the shadow follows them
+      // instead of being clipped off at the corner radius.
+      const surface = roundedImage(img, w, h, radius, layer.text);
+      if (shadow > 0) {
+        ctx.shadowColor = 'rgba(0,0,0,0.45)';
+        ctx.shadowBlur = shadow * 40;
+        ctx.shadowOffsetY = shadow * 14;
+      }
+      ctx.drawImage(surface, -w / 2, -h / 2 + bobY, w, h);
+    } else {
+      if (fit === 'cover') {
+        roundRectPath(ctx, clipW, clipH, radius);
+        ctx.clip();
+      }
+      ctx.drawImage(img, -w / 2, -h / 2 + bobY, w, h);
+    }
+    ctx.restore();
+  }
+
+  /** Visible box of a layer in local (untransformed) pixels, for masks and hits. */
+  function layerBox(layer: Layer, t: number): { w: number; h: number } | null {
+    if (layer.kind === 'text') {
+      const metrics = textMetrics(layer, t);
+      return { w: metrics.lineWidth, h: metrics.height };
+    }
+    if (layer.kind === 'shape') {
+      const box = shapeDefaults(layer, t);
+      return { w: Math.abs(box.w), h: Math.abs(box.h) };
+    }
+    if (layer.kind === 'card') {
+      return { w: dim(layer.nums.w, W, W * 0.5), h: dim(layer.nums.h, W, H * 0.3) };
+    }
+    if (layer.kind === 'image') {
+      const box = imageBox(layer);
+      return box.fit === 'cover' ? { w: box.boxW, h: box.boxH } : { w: box.w, h: box.h };
+    }
+    return null;
+  }
+
   /** Resolves `follow=id,edge,offset` against another layer's current box. */
   function followTarget(layer: Layer, t: number): { x: number; y: number } | null {
     const spec = layer.props.follow;
@@ -644,9 +901,37 @@ export function createScene(recipe: Recipe, size: SceneSize) {
     ctx.rotate((rotation * Math.PI) / 180);
     ctx.scale(sx, sy);
 
+    // `reveal=left|right|up|down` wipes the layer in from that edge. It runs on
+    // its own clock (`inDur`), so it composes with any `in=` animation.
+    const reveal = layer.props.reveal;
+    if (reveal && reveal !== 'none') {
+      const box = layerBox(layer, t);
+      if (box && box.w > 0 && box.h > 0) {
+        const p = clamp01((t - layer.start) / Math.max(0.01, layer.animInDur));
+        let x0 = -box.w / 2;
+        let y0 = -box.h / 2;
+        let rw = box.w;
+        let rh = box.h;
+        if (reveal === 'left') rw = box.w * p;
+        else if (reveal === 'right') {
+          rw = box.w * p;
+          x0 = box.w / 2 - rw;
+        } else if (reveal === 'up') {
+          rh = box.h * p;
+          y0 = box.h / 2 - rh;
+        } else {
+          rh = box.h * p;
+        }
+        ctx.beginPath();
+        ctx.rect(x0, y0, Math.max(0.001, rw), Math.max(0.001, rh));
+        ctx.clip();
+      }
+    }
+
     if (layer.kind === 'text') drawText(ctx, layer, t, alpha, inE);
     else if (layer.kind === 'shape') drawShape(ctx, layer, t, alpha);
     else if (layer.kind === 'card') drawCard(ctx, layer);
+    else if (layer.kind === 'image') drawImageLayer(ctx, layer, t);
 
     ctx.restore();
     ctx.filter = 'none';
@@ -655,14 +940,16 @@ export function createScene(recipe: Recipe, size: SceneSize) {
     ctx.globalAlpha = 1;
   }
 
-  function cameraAt(active: Layer[], t: number) {
-    const cameras = active.filter((l) => l.kind === 'camera');
-    const layer = cameras[cameras.length - 1];
-    if (!layer) return null;
+  function cameraAt(t: number) {
+    let camera: Layer | null = null;
+    for (const layer of cameraLayers) {
+      if (t >= layer.start - 1e-6 && t <= layer.end + 1e-6) camera = layer;
+    }
+    if (!camera) return null;
     return {
-      zoom: evalKeys(layer.keys.zoom, t, layer.nums.zoom ?? 1),
-      x: evalKeys(layer.keys.x, t, layer.nums.x ?? 0.5),
-      y: evalKeys(layer.keys.y, t, layer.nums.y ?? 0.5),
+      zoom: evalKeys(camera.keys.zoom, t, camera.nums.zoom ?? 1),
+      x: evalKeys(camera.keys.x, t, camera.nums.x ?? 0.5),
+      y: evalKeys(camera.keys.y, t, camera.nums.y ?? 0.5),
     };
   }
 
@@ -674,19 +961,14 @@ export function createScene(recipe: Recipe, size: SceneSize) {
     ctx.fillStyle = '#0B0F14';
     ctx.fillRect(0, 0, W, H);
 
-    const active = recipe.layers.filter((l) => t >= l.start - 1e-6 && t <= l.end + 1e-6);
-
-    for (const layer of active) {
-      if (layer.kind === 'scene') drawScene(ctx, layer);
+    for (const layer of sceneLayers) {
+      if (t >= layer.start - 1e-6 && t <= layer.end + 1e-6) drawScene(ctx, layer);
     }
 
-    const camera = cameraAt(active, t);
+    const camera = cameraAt(t);
 
-    const drawn = active
-      .filter((l) => l.kind !== 'scene' && l.kind !== 'camera')
-      .sort((a, b) => a.z - b.z || a.start - b.start);
-
-    for (const layer of drawn) {
+    for (const layer of drawOrder) {
+      if (t < layer.start - 1e-6 || t > layer.end + 1e-6) continue;
       ctx.save();
       if (camera) {
         // Depth: 0 pins the layer to the frame, 1 follows the camera fully.
@@ -704,27 +986,7 @@ export function createScene(recipe: Recipe, size: SceneSize) {
   }
 
   function measureLayer(layer: Layer, t: number): { w: number; h: number } {
-    if (layer.kind === 'text') {
-      if (!measureCtx) return { w: 0, h: 0 };
-      const metrics = textMetrics(layer, t);
-      return { w: metrics.lineWidth, h: metrics.height };
-    }
-
-    if (layer.kind === 'shape') {
-      const { w, h } = shapeDefaults(layer, t);
-      const shapeW = Math.abs(w);
-      const shapeH = layer.shape === 'circle' || layer.shape === 'check' ? Math.abs(w) : Math.abs(h);
-      return { w: shapeW, h: shapeH };
-    }
-
-    if (layer.kind === 'card') {
-      return {
-        w: dim(layer.nums.w, W, W * 0.5),
-        h: dim(layer.nums.h, W, H * 0.3),
-      };
-    }
-
-    return { w: 0, h: 0 };
+    return layerBox(layer, t) ?? { w: 0, h: 0 };
   }
 
   /**
@@ -732,14 +994,11 @@ export function createScene(recipe: Recipe, size: SceneSize) {
    * pixels, front-most first. Used by the studio for click-to-select.
    */
   function hits(t: number): HitBox[] {
-    const active = recipe.layers.filter((l) => t >= l.start - 1e-6 && t <= l.end + 1e-6);
-    const camera = cameraAt(active, t);
+    const camera = cameraAt(t);
     const boxes: HitBox[] = [];
 
     // Same paint order as draw(), so the last painted layer wins a click.
-    const drawn = active
-      .filter((l) => l.kind !== 'scene' && l.kind !== 'camera')
-      .sort((a, b) => a.z - b.z || a.start - b.start);
+    const drawn = drawOrder.filter((l) => t >= l.start - 1e-6 && t <= l.end + 1e-6);
 
     for (const layer of drawn) {
       const frame = layerFrame(layer, t);

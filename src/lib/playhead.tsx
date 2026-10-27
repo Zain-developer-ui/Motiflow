@@ -88,10 +88,11 @@ export const previewFps = {
 
 export function PreviewFps() {
   const value = useSyncExternalStore(subscribeFps, previewFps.get, previewFps.get);
-  if (!value) return null;
+  // Always rendered: unmounting the readout re-flowed the transport, which
+  // narrowed the scrub bar by its width every time playback started.
   return (
-    <span className="fps" title="Preview frames per second">
-      {value} fps
+    <span className="fps" title="Preview frames per second" aria-hidden={value === 0}>
+      {value ? `${value} fps` : null}
     </span>
   );
 }

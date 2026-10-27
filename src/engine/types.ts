@@ -1,4 +1,4 @@
-export type LayerKind = 'scene' | 'text' | 'shape' | 'card' | 'camera';
+export type LayerKind = 'scene' | 'text' | 'shape' | 'card' | 'image' | 'camera';
 
 export type ShapeKind = 'rect' | 'circle' | 'pill' | 'ring' | 'line' | 'check' | 'arrow';
 
